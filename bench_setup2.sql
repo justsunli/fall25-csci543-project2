@@ -14,3 +14,5 @@ SELECT
         ELSE (i % 64) * 1000                       
     END AS v
 FROM range(0, 1000000) t(i);
+
+--- for every 1000 rows, there is a 0 and 1000000000, the rest are in the range [0, 63000]
