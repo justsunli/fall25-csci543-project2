@@ -11,6 +11,7 @@
 #include "duckdb/storage/table/column_data.hpp"
 #include "duckdb/storage/table/column_segment.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
+#include "duckdb/common/types/uhugeint.hpp"
 #include <cstdio>
 #include <atomic>
 
@@ -237,6 +238,47 @@ T NumericStats::GetMaxUnsafe(const BaseStatistics &stats) {
 	return GetNumericValueUnion::Operation<T>(NumericStats::GetDataUnsafe(stats).max);
 }
 
+// Helper for ComputeBinIndex: normalize (value - min) / (max - min) in long double space
+template <class T>
+static inline long double ComputeBinIndexImpl(T value, T min, T max) {
+	long double v = static_cast<long double>(value);
+	long double vmin = static_cast<long double>(min);
+	long double vmax = static_cast<long double>(max);
+	long double range = vmax - vmin;
+	// caller checks min == max, so range should normally be non-zero
+	return (v - vmin) / range;
+}
+
+// INT128 specialization
+template <>
+inline long double ComputeBinIndexImpl<hugeint_t>(hugeint_t value, hugeint_t min, hugeint_t max) {
+	double dv, dmin, dmax;
+	Hugeint::TryCast<double>(value, dv);
+	Hugeint::TryCast<double>(min, dmin);
+	Hugeint::TryCast<double>(max, dmax);
+
+	long double v = static_cast<long double>(dv);
+	long double vmin = static_cast<long double>(dmin);
+	long double vmax = static_cast<long double>(dmax);
+	long double range = vmax - vmin;
+	return (v - vmin) / range;
+}
+
+// UINT128 specialization
+template <>
+inline long double ComputeBinIndexImpl<uhugeint_t>(uhugeint_t value, uhugeint_t min, uhugeint_t max) {
+	double dv, dmin, dmax;
+	Uhugeint::TryCast<double>(value, dv);
+	Uhugeint::TryCast<double>(min, dmin);
+	Uhugeint::TryCast<double>(max, dmax);
+
+	long double v = static_cast<long double>(dv);
+	long double vmin = static_cast<long double>(dmin);
+	long double vmax = static_cast<long double>(dmax);
+	long double range = vmax - vmin;
+	return (v - vmin) / range;
+}
+
 template <class T>
 uint8_t NumericStats::ComputeBinIndex(T value, T min, T max, uint8_t bins) {
 	if (min == max || bins <= 1) {
@@ -248,10 +290,13 @@ uint8_t NumericStats::ComputeBinIndex(T value, T min, T max, uint8_t bins) {
 	if (GreaterThanEquals::Operation(value, max)) {
 		return bins - 1;
 	}
-	long double range = static_cast<long double>(max) - static_cast<long double>(min);
-	long double normalized = static_cast<long double>(value) - static_cast<long double>(min);
-	auto idx = static_cast<uint8_t>((normalized / range) * bins);
 
+	// Use helper (handles INT128 / UINT128 too)
+	long double normalized = ComputeBinIndexImpl<T>(value, min, max);
+	auto idx = static_cast<uint8_t>(normalized * bins);
+	if (idx >= bins) {
+		idx = bins - 1;
+	}
 	return idx;
 }
 
@@ -279,6 +324,7 @@ static void BuildImprintForSegmentInternal(BaseStatistics &stats, ColumnData &co
 	// get the ref to the column segment passed in
 	auto &segment = *segment_node.node;
 	ColumnScanState scan_state(nullptr);
+	// segment_node.current is used in CheckpointScan path
 	scan_state.current = &segment_node;
 	segment.InitializeScan(scan_state);
 
@@ -357,9 +403,6 @@ FilterPropagateResult CheckZonemapTemplated(const BaseStatistics &stats, Express
 		}
 		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
 	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
-		// GreaterThanEquals::Operation(X, C)
-		// this can be true only if max(X) >= C
-		// if min(X) >= C, then this is always true
 		if (GreaterThanEquals::Operation(min_value, constant)) {
 			return FilterPropagateResult::FILTER_ALWAYS_TRUE;
 		} else if (GreaterThanEquals::Operation(max_value, constant)) {
@@ -368,9 +411,6 @@ FilterPropagateResult CheckZonemapTemplated(const BaseStatistics &stats, Express
 			return FilterPropagateResult::FILTER_ALWAYS_FALSE;
 		}
 	case ExpressionType::COMPARE_GREATERTHAN:
-		// GreaterThan::Operation(X, C)
-		// this can be true only if max(X) > C
-		// if min(X) > C, then this is always true
 		if (GreaterThan::Operation(min_value, constant)) {
 			return FilterPropagateResult::FILTER_ALWAYS_TRUE;
 		} else if (GreaterThan::Operation(max_value, constant)) {
@@ -379,9 +419,6 @@ FilterPropagateResult CheckZonemapTemplated(const BaseStatistics &stats, Express
 			return FilterPropagateResult::FILTER_ALWAYS_FALSE;
 		}
 	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
-		// LessThanEquals::Operation(X, C)
-		// this can be true only if min(X) <= C
-		// if max(X) <= C, then this is always true
 		if (LessThanEquals::Operation(max_value, constant)) {
 			return FilterPropagateResult::FILTER_ALWAYS_TRUE;
 		} else if (LessThanEquals::Operation(min_value, constant)) {
@@ -390,9 +427,6 @@ FilterPropagateResult CheckZonemapTemplated(const BaseStatistics &stats, Express
 			return FilterPropagateResult::FILTER_ALWAYS_FALSE;
 		}
 	case ExpressionType::COMPARE_LESSTHAN:
-		// LessThan::Operation(X, C)
-		// this can be true only if min(X) < C
-		// if max(X) < C, then this is always true
 		if (LessThan::Operation(max_value, constant)) {
 			return FilterPropagateResult::FILTER_ALWAYS_TRUE;
 		} else if (LessThan::Operation(min_value, constant)) {
@@ -471,7 +505,6 @@ FilterPropagateResult CheckImprintTemplated(const BaseStatistics &stats, Express
 		uint64_t lower_bits = (bin_index == 0) ? 0 : ((1ULL << bin_index) - 1);
 		uint64_t greater_than_mask = all_bits & ~lower_bits;
 
-		// print greater_than_mask for debugging
 		string min_str = std::to_string(min);
 		string max_str = std::to_string(max);
 		IMPRINT_LOG(StringUtil::Format(
@@ -490,8 +523,6 @@ FilterPropagateResult CheckImprintTemplated(const BaseStatistics &stats, Express
 			return FilterPropagateResult::FILTER_ALWAYS_FALSE;
 		}
 	}
-	// TODO: ADD MORE CONDITIONS HERE
-
 	// otherwise, still need to scan
 	string min_str = std::to_string(min);
 	string max_str = std::to_string(max);
@@ -587,11 +618,6 @@ FilterPropagateResult NumericStats::CheckZonemap(const BaseStatistics &stats, Ex
 	    !HasImprint(stats)) {
 		return zonemap_result;
 	}
-
-	// if (comparison_type != ExpressionType::COMPARE_EQUAL &&
-	//     comparison_type != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
-	// 	return zonemap_result;
-	// }
 
 	IMPRINT_LOG(StringUtil::Format("[imprint-check-enter] type=%s bitmap=0x%016llx bins=%d", stats.GetType().ToString(),
 	                               NumericStats::GetImprintBitmapUnsafe(stats),
@@ -1017,6 +1043,18 @@ void NumericStats::BuildImprintForSegment(ColumnData &col_data, SegmentNode<Colu
 		break;
 	case PhysicalType::UINT64:
 		BuildImprintForSegmentInternal<uint64_t>(stats, col_data, segment_node);
+		break;
+	case PhysicalType::INT128:
+		BuildImprintForSegmentInternal<hugeint_t>(stats, col_data, segment_node);
+		break;
+	case PhysicalType::UINT128:
+		BuildImprintForSegmentInternal<uhugeint_t>(stats, col_data, segment_node);
+		break;
+	case PhysicalType::FLOAT:
+		BuildImprintForSegmentInternal<float>(stats, col_data, segment_node);
+		break;
+	case PhysicalType::DOUBLE:
+		BuildImprintForSegmentInternal<double>(stats, col_data, segment_node);
 		break;
 	default:
 		// for unsupported types, invalid imprint stats
